@@ -704,6 +704,11 @@ def colorized_raw_mesh(scan_dir: Path, out_dir: Path, manifest: dict[str, Any]) 
     result = out_dir / "result_raw_colored.ply"
     if not o3d.io.write_triangle_mesh(str(result), mesh):
         return None
+
+    baked = bake_vertex_color_texture(mesh, out_dir)
+    if baked is not None:
+        return baked
+
     return result
 
 
@@ -734,6 +739,96 @@ def fallback_raw_mesh(scan_dir: Path, out_dir: Path) -> Path | None:
     shutil.copy2(raw_mesh, result)
     return result
 
+def bake_vertex_color_texture(mesh, out_dir: Path) -> Path | None:
+    """
+    임시 Texture Baking:
+    vertex color를 기반으로 간단한 texture atlas를 만들고 OBJ로 저장한다.
+
+    주의:
+    이건 RGB keyframe reprojection 기반의 정석 texture baking은 아니고,
+    현재 vertex color 결과를 Unity에서 texture material로 보기 위한 1차 구현이다.
+    """
+
+    try:
+        import numpy as np
+        import cv2
+    except ImportError:
+        print("bake_vertex_color_texture skipped: numpy or cv2 not installed")
+        return None
+
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    colors = np.asarray(mesh.vertex_colors)
+
+    if len(vertices) == 0 or len(triangles) == 0 or len(colors) == 0:
+        return None
+
+    texture_size = 2048
+    texture = np.zeros((texture_size, texture_size, 3), dtype=np.uint8)
+
+    obj_path = out_dir / "result_textured.obj"
+    mtl_path = out_dir / "result_textured.mtl"
+    tex_path = out_dir / "result_texture.png"
+
+    # 아주 단순한 planar UV 생성: XZ 기준
+    min_x, min_z = vertices[:, 0].min(), vertices[:, 2].min()
+    max_x, max_z = vertices[:, 0].max(), vertices[:, 2].max()
+
+    range_x = max(max_x - min_x, 1e-6)
+    range_z = max(max_z - min_z, 1e-6)
+
+    uvs = np.zeros((len(vertices), 2), dtype=np.float32)
+    uvs[:, 0] = (vertices[:, 0] - min_x) / range_x
+    uvs[:, 1] = (vertices[:, 2] - min_z) / range_z
+
+    # texture에 vertex color 찍기
+    for i, uv in enumerate(uvs):
+        x = int(np.clip(uv[0] * (texture_size - 1), 0, texture_size - 1))
+        y = int(np.clip((1.0 - uv[1]) * (texture_size - 1), 0, texture_size - 1))
+
+        color = np.clip(colors[i] * 255.0, 0, 255).astype(np.uint8)
+        texture[y, x] = color[::-1]  # RGB -> BGR for cv2
+
+    # 빈 공간 보간용 dilation
+    mask = np.any(texture > 0, axis=2).astype(np.uint8) * 255
+    kernel = np.ones((5, 5), np.uint8)
+
+    for _ in range(20):
+        dilated = cv2.dilate(texture, kernel, iterations=1)
+        empty = mask == 0
+        texture[empty] = dilated[empty]
+        mask = np.any(texture > 0, axis=2).astype(np.uint8) * 255
+
+    cv2.imwrite(str(tex_path), texture)
+
+    # MTL 저장
+    with open(mtl_path, "w", encoding="utf-8") as f:
+        f.write("newmtl baked_material\n")
+        f.write("Ka 1.000 1.000 1.000\n")
+        f.write("Kd 1.000 1.000 1.000\n")
+        f.write("Ks 0.000 0.000 0.000\n")
+        f.write("d 1.0\n")
+        f.write("illum 2\n")
+        f.write(f"map_Kd {tex_path.name}\n")
+
+    # OBJ 저장
+    with open(obj_path, "w", encoding="utf-8") as f:
+        f.write(f"mtllib {mtl_path.name}\n")
+        f.write("usemtl baked_material\n")
+
+        for v in vertices:
+            f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+
+        for uv in uvs:
+            f.write(f"vt {uv[0]} {uv[1]}\n")
+
+        for tri in triangles:
+            # OBJ index는 1부터 시작
+            a, b, c = tri + 1
+            f.write(f"f {a}/{a} {b}/{b} {c}/{c}\n")
+
+    print(f"baked texture obj={obj_path}")
+    return obj_path
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -766,3 +861,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

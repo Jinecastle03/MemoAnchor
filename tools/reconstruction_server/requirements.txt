@@ -1,2 +1,2 @@
 open3d>=0.18
-
+opencv-python
