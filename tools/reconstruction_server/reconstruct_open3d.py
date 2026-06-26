@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Best-effort Open3D reconstruction for MemoAnchor RGB-D packages."""
-
 from __future__ import annotations
 
 import argparse
@@ -675,6 +672,7 @@ def find_raw_mesh(scan_dir: Path) -> Path | None:
     return nested[0] if nested else None
 
 
+
 def colorized_raw_mesh(scan_dir: Path, out_dir: Path, manifest: dict[str, Any]) -> Path | None:
     try:
         import open3d as o3d
@@ -699,29 +697,54 @@ def colorized_raw_mesh(scan_dir: Path, out_dir: Path, manifest: dict[str, Any]) 
     mesh = cleanup_mesh(mesh)
     mesh = merge_with_local_hole_fill(mesh)
     mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
     clamp_vertex_colors(mesh)
 
-    result = out_dir / "result_raw_colored.ply"
-    if not o3d.io.write_triangle_mesh(str(result), mesh):
+    # Keep the vertex-colored PLY for debugging/backward compatibility.
+    raw_colored = out_dir / "result_raw_colored.ply"
+    if not o3d.io.write_triangle_mesh(str(raw_colored), mesh):
         return None
 
-    baked = bake_vertex_color_texture(mesh, out_dir)
+    # Main path: RGB keyframes + depth + pose + intrinsics -> texture atlas.
+    baked = bake_keyframe_texture_atlas(mesh, scan_dir, manifest, out_dir)
     if baked is not None:
         return baked
 
-    return result
+    # Fallback path: keep the previous vertex-color-to-texture bake so the server still returns a textured OBJ.
+    baked = bake_vertex_color_texture(
+        mesh,
+        out_dir,
+        obj_name="result.obj",
+        mtl_name="result.mtl",
+        texture_name="result_texture.png",
+    )
+    if baked is not None:
+        return baked
+
+    return raw_colored
 
 
 def choose_result(scan_dir: Path, out_dir: Path, manifest: dict[str, Any]) -> Path | None:
     raw_result = colorized_raw_mesh(scan_dir, out_dir, manifest)
-    tsdf_result = try_open3d_tsdf(scan_dir, out_dir, manifest)
 
     # For MemoAnchor the first goal is a recognizable surface that can receive notes.
-    # ARKit's mesh usually preserves room layout better than low-resolution TSDF, while TSDF is a fallback
-    # when no raw mesh or too little color projection is available.
-    chosen = raw_result or tsdf_result
+    # ARKit's mesh usually preserves room layout better than low-resolution TSDF.
+    # Therefore, run TSDF only when the raw mesh path cannot produce a result.
+    chosen = raw_result
+    if chosen is None:
+        chosen = try_open3d_tsdf(scan_dir, out_dir, manifest)
     if chosen is None:
         return None
+
+    if chosen.suffix.lower() == ".obj":
+        # The new primary output is result.obj + result.mtl + result_texture.png.
+        # Also keep result.ply if the raw colored mesh exists, because older viewers may still look for it.
+        raw_colored = out_dir / "result_raw_colored.ply"
+        legacy_ply = out_dir / "result.ply"
+        if raw_colored.exists() and raw_colored != legacy_ply:
+            shutil.copy2(raw_colored, legacy_ply)
+        print(f"chosen_result={chosen.name}")
+        return chosen
 
     final = out_dir / "result.ply"
     if chosen != final:
@@ -739,21 +762,348 @@ def fallback_raw_mesh(scan_dir: Path, out_dir: Path) -> Path | None:
     shutil.copy2(raw_mesh, result)
     return result
 
-def bake_vertex_color_texture(mesh, out_dir: Path) -> Path | None:
-    """
-    임시 Texture Baking:
-    vertex color를 기반으로 간단한 texture atlas를 만들고 OBJ로 저장한다.
 
-    주의:
-    이건 RGB keyframe reprojection 기반의 정석 texture baking은 아니고,
-    현재 vertex color 결과를 Unity에서 texture material로 보기 위한 1차 구현이다.
+def project_vertices_to_keyframe(vertices: "object", keyframe: dict[str, Any], *, use_depth_check: bool = True) -> tuple["object", "object", "object", "object"]:
+    """Project world-space mesh vertices into one RGB keyframe.
+
+    Returns pixel_x, pixel_y, z, valid arrays. This uses the same Unity/ARKit camera convention
+    as colorize_mesh_from_keyframes(), so both vertex-coloring and texture-baking stay aligned.
+    """
+    import numpy as np
+
+    rel = vertices - keyframe["position"]
+    with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+        camera_local = rel @ keyframe["rotation"]
+        z = camera_local[:, 2]
+        pixel_x = keyframe["fx"] * (camera_local[:, 0] / z) + keyframe["cx"]
+        pixel_y = keyframe["cy"] - keyframe["fy"] * (camera_local[:, 1] / z)
+
+    valid = np.isfinite(camera_local).all(axis=1) & np.isfinite(pixel_x) & np.isfinite(pixel_y)
+    valid &= z > 0.05
+    valid &= pixel_x >= 2
+    valid &= pixel_x < keyframe["width"] - 2
+    valid &= pixel_y >= 2
+    valid &= pixel_y < keyframe["height"] - 2
+
+    depth = keyframe.get("depth") if use_depth_check else None
+    if depth is not None and np.any(valid):
+        depth_h, depth_w = depth.shape
+        valid_indices = np.flatnonzero(valid)
+        depth_x = np.clip((pixel_x[valid_indices] / keyframe["width"] * depth_w).astype(np.int32), 0, depth_w - 1)
+        depth_y = np.clip((pixel_y[valid_indices] / keyframe["height"] * depth_h).astype(np.int32), 0, depth_h - 1)
+        sampled_depth = depth[depth_y, depth_x]
+        depth_diff = np.abs(sampled_depth - z[valid_indices])
+        tolerance = np.maximum(0.18, z[valid_indices] * 0.10)
+        depth_valid = (sampled_depth <= 0) | (depth_diff <= tolerance)
+
+        refined = np.zeros_like(valid)
+        refined[valid_indices] = depth_valid
+        valid &= refined
+
+    return pixel_x, pixel_y, z, valid
+
+
+def choose_texture_keyframes_for_triangles(
+    vertices: "object",
+    triangles: "object",
+    triangle_normals: "object",
+    keyframes: list[dict[str, Any]],
+    *,
+    use_depth_check: bool = True,
+) -> "object":
+    """Assign each triangle to the keyframe that should give the best texture sample."""
+    import numpy as np
+
+    triangle_count = len(triangles)
+    assigned = np.full((triangle_count,), -1, dtype=np.int32)
+    best_scores = np.full((triangle_count,), -1e18, dtype=np.float64)
+    triangle_centers = vertices[triangles].mean(axis=1)
+
+    for keyframe_index, keyframe in enumerate(keyframes):
+        pixel_x, pixel_y, z, valid_vertices = project_vertices_to_keyframe(
+            vertices,
+            keyframe,
+            use_depth_check=use_depth_check,
+        )
+
+        tri_valid = valid_vertices[triangles].all(axis=1)
+        if not np.any(tri_valid):
+            continue
+
+        tri_px = pixel_x[triangles]
+        tri_py = pixel_y[triangles]
+        projected_area = 0.5 * np.abs(
+            tri_px[:, 0] * (tri_py[:, 1] - tri_py[:, 2])
+            + tri_px[:, 1] * (tri_py[:, 2] - tri_py[:, 0])
+            + tri_px[:, 2] * (tri_py[:, 0] - tri_py[:, 1])
+        )
+        tri_valid &= np.isfinite(projected_area) & (projected_area > 0.35)
+        if not np.any(tri_valid):
+            continue
+
+        mean_z = np.maximum(z[triangles].mean(axis=1), 1e-6)
+        u_center = tri_px.mean(axis=1) / max(1, keyframe["width"])
+        v_center = tri_py.mean(axis=1) / max(1, keyframe["height"])
+        center_distance = np.sqrt((u_center - 0.5) ** 2 + (v_center - 0.5) ** 2)
+        center_score = 1.0 - np.clip(center_distance / 0.7, 0.0, 1.0)
+        distance_score = 1.0 / (0.25 + mean_z)
+
+        view = keyframe["position"] - triangle_centers
+        view_norm = np.maximum(np.linalg.norm(view, axis=1), 1e-6)
+        view_dir = view / view_norm[:, None]
+        facing_score = np.clip(np.abs(np.sum(triangle_normals * view_dir, axis=1)), 0.0, 1.0)
+
+        # Prefer large projected area/detail, near image center, nearer camera, and a front-facing view.
+        score = np.log1p(projected_area) * 2.0 + center_score * 2.0 + distance_score * 0.6 + facing_score * 0.5
+        update = tri_valid & (score > best_scores)
+        assigned[update] = keyframe_index
+        best_scores[update] = score[update]
+
+    return assigned
+
+
+def dilate_texture_padding(texture: "object", mask: "object", *, iterations: int = 24) -> tuple["object", "object"]:
+    import cv2
+    import numpy as np
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    for _ in range(iterations):
+        grown_mask = cv2.dilate(mask, kernel, iterations=1)
+        fill = (mask == 0) & (grown_mask > 0)
+        if not np.any(fill):
+            break
+        grown_texture = cv2.dilate(texture, kernel, iterations=1)
+        texture[fill] = grown_texture[fill]
+        mask[fill] = 255
+
+    return texture, mask
+
+
+def write_textured_obj(
+    obj_path: Path,
+    mtl_path: Path,
+    texture_name: str,
+    vertices: "object",
+    triangles: "object",
+    face_uvs: "object",
+) -> None:
+    with open(mtl_path, "w", encoding="utf-8") as f:
+        f.write("newmtl baked_material\n")
+        f.write("Ka 1.000 1.000 1.000\n")
+        f.write("Kd 1.000 1.000 1.000\n")
+        f.write("Ks 0.000 0.000 0.000\n")
+        f.write("d 1.0\n")
+        f.write("illum 2\n")
+        f.write(f"map_Kd {texture_name}\n")
+
+    with open(obj_path, "w", encoding="utf-8") as f:
+        f.write(f"mtllib {mtl_path.name}\n")
+        f.write("usemtl baked_material\n")
+        f.write("# MemoAnchor RGB-D keyframe texture atlas\n")
+
+        for vertex in vertices:
+            f.write(f"v {vertex[0]:.9f} {vertex[1]:.9f} {vertex[2]:.9f}\n")
+
+        for uv in face_uvs.reshape((-1, 2)):
+            f.write(f"vt {uv[0]:.9f} {uv[1]:.9f}\n")
+
+        for face_index, tri in enumerate(triangles):
+            vertex_indices = tri + 1
+            texcoord_base = face_index * 3 + 1
+            f.write(
+                "f "
+                f"{vertex_indices[0]}/{texcoord_base} "
+                f"{vertex_indices[1]}/{texcoord_base + 1} "
+                f"{vertex_indices[2]}/{texcoord_base + 2}\n"
+            )
+
+
+def bake_keyframe_texture_atlas(
+    mesh: "object",
+    scan_dir: Path,
+    manifest: dict[str, Any],
+    out_dir: Path,
+    *,
+    texture_size: int = 4096,
+    use_depth_check: bool = True,
+) -> Path | None:
+    """Bake a real texture atlas by projecting mesh triangles into RGB keyframes.
+
+    Output:
+    - result.obj
+    - result.mtl
+    - result_texture.png
+
+    Each mesh triangle receives its own atlas island. That avoids the incorrect global XZ planar UV used
+    in the temporary vertex-color bake and lets the PNG come directly from RGB keyframe pixels.
+    """
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        print("bake_keyframe_texture_atlas skipped: numpy, cv2, or PIL not installed")
+        return None
+
+    keyframes = load_color_keyframes(scan_dir, manifest)
+    if not keyframes:
+        print("bake_keyframe_texture_atlas skipped: no RGB keyframes")
+        return None
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    triangles = np.asarray(mesh.triangles, dtype=np.int32)
+    if len(vertices) == 0 or len(triangles) == 0:
+        return None
+
+    if not mesh.has_triangle_normals():
+        mesh.compute_triangle_normals()
+    triangle_normals = np.asarray(mesh.triangle_normals, dtype=np.float64)
+    if len(triangle_normals) != len(triangles):
+        mesh.compute_triangle_normals()
+        triangle_normals = np.asarray(mesh.triangle_normals, dtype=np.float64)
+
+    assigned_keyframes = choose_texture_keyframes_for_triangles(
+        vertices,
+        triangles,
+        triangle_normals,
+        keyframes,
+        use_depth_check=use_depth_check,
+    )
+    assigned_count = int(np.count_nonzero(assigned_keyframes >= 0))
+    if assigned_count == 0:
+        print("bake_keyframe_texture_atlas skipped: no triangles passed projection/depth checks")
+        return None
+
+    obj_path = out_dir / "result.obj"
+    mtl_path = out_dir / "result.mtl"
+    texture_path = out_dir / "result_texture.png"
+
+    triangle_count = len(triangles)
+    grid_cols = int(math.ceil(math.sqrt(triangle_count)))
+    grid_rows = int(math.ceil(triangle_count / max(1, grid_cols)))
+    tile_width = max(3, texture_size // max(1, grid_cols))
+    tile_height = max(3, texture_size // max(1, grid_rows))
+    tile_min = min(tile_width, tile_height)
+    padding = 1 if tile_min < 10 else 2
+
+    texture = np.zeros((texture_size, texture_size, 3), dtype=np.uint8)
+    mask = np.zeros((texture_size, texture_size), dtype=np.uint8)
+    face_uvs = np.zeros((triangle_count, 3, 2), dtype=np.float32)
+
+    vertex_colors = np.asarray(mesh.vertex_colors, dtype=np.float64) if mesh.has_vertex_colors() else None
+    default_rgb = np.array([148, 179, 189], dtype=np.uint8)
+
+    # Recompute projections only for keyframes actually used by at least one triangle.
+    projected_cache: dict[int, tuple[Any, Any]] = {}
+    for keyframe_index in sorted(set(int(i) for i in assigned_keyframes if int(i) >= 0)):
+        pixel_x, pixel_y, _, _ = project_vertices_to_keyframe(
+            vertices,
+            keyframes[keyframe_index],
+            use_depth_check=False,
+        )
+        projected_cache[keyframe_index] = (pixel_x, pixel_y)
+        keyframes[keyframe_index]["image_u8"] = np.clip(keyframes[keyframe_index]["image"] * 255.0, 0, 255).astype(np.uint8)
+
+    for face_index, tri in enumerate(triangles):
+        row = face_index // grid_cols
+        col = face_index % grid_cols
+        x0 = col * tile_width
+        y0 = row * tile_height
+        x1 = texture_size if col == grid_cols - 1 else min(texture_size, (col + 1) * tile_width)
+        y1 = texture_size if row == grid_rows - 1 else min(texture_size, (row + 1) * tile_height)
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            continue
+
+        local_width = x1 - x0
+        local_height = y1 - y0
+        pad = min(padding, max(0, (min(local_width, local_height) - 2) // 2))
+        dst_global = np.array(
+            [
+                [x0 + pad, y1 - pad - 1],
+                [x1 - pad - 1, y1 - pad - 1],
+                [(x0 + x1 - 1) * 0.5, y0 + pad],
+            ],
+            dtype=np.float32,
+        )
+        dst_local = dst_global - np.array([x0, y0], dtype=np.float32)
+        dst_int = np.rint(dst_local).astype(np.int32)
+
+        face_uvs[face_index, :, 0] = dst_global[:, 0] / max(1, texture_size - 1)
+        face_uvs[face_index, :, 1] = 1.0 - (dst_global[:, 1] / max(1, texture_size - 1))
+
+        local_mask = np.zeros((local_height, local_width), dtype=np.uint8)
+        cv2.fillConvexPoly(local_mask, dst_int, 255)
+
+        keyframe_index = int(assigned_keyframes[face_index])
+        wrote_from_rgb = False
+        if keyframe_index >= 0:
+            pixel_x, pixel_y = projected_cache[keyframe_index]
+            src_triangle = np.column_stack((pixel_x[tri], pixel_y[tri])).astype(np.float32)
+            src_area = 0.5 * abs(
+                src_triangle[0, 0] * (src_triangle[1, 1] - src_triangle[2, 1])
+                + src_triangle[1, 0] * (src_triangle[2, 1] - src_triangle[0, 1])
+                + src_triangle[2, 0] * (src_triangle[0, 1] - src_triangle[1, 1])
+            )
+            if np.isfinite(src_triangle).all() and src_area > 0.35:
+                transform = cv2.getAffineTransform(src_triangle, dst_local.astype(np.float32))
+                warped = cv2.warpAffine(
+                    keyframes[keyframe_index]["image_u8"],
+                    transform,
+                    (local_width, local_height),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT_101,
+                )
+                roi = texture[y0:y1, x0:x1]
+                roi[local_mask > 0] = warped[local_mask > 0]
+                wrote_from_rgb = True
+
+        if not wrote_from_rgb:
+            if vertex_colors is not None and len(vertex_colors) == len(vertices):
+                rgb = np.clip(vertex_colors[tri].mean(axis=0) * 255.0, 0, 255).astype(np.uint8)
+            else:
+                rgb = default_rgb
+            roi = texture[y0:y1, x0:x1]
+            roi[local_mask > 0] = rgb
+
+        mask_roi = mask[y0:y1, x0:x1]
+        mask_roi[local_mask > 0] = 255
+
+    texture, mask = dilate_texture_padding(texture, mask, iterations=24)
+    texture[mask == 0] = default_rgb
+    Image.fromarray(texture, mode="RGB").save(texture_path)
+    write_textured_obj(obj_path, mtl_path, texture_path.name, vertices, triangles, face_uvs)
+
+    print(
+        "baked_keyframe_texture "
+        f"triangles={assigned_count}/{triangle_count} "
+        f"texture={texture_size}x{texture_size} "
+        f"tile={tile_width}x{tile_height} "
+        f"obj={obj_path.name}"
+    )
+    return obj_path
+
+
+def bake_vertex_color_texture(
+    mesh: "object",
+    out_dir: Path,
+    *,
+    obj_name: str = "result_textured.obj",
+    mtl_name: str = "result_textured.mtl",
+    texture_name: str = "result_texture.png",
+) -> Path | None:
+    """
+    Fallback texture baking.
+
+    This keeps the previous behavior: convert existing vertex colors to a simple planar texture.
+    The preferred path is bake_keyframe_texture_atlas(), which samples RGB keyframes directly.
     """
 
     try:
         import numpy as np
         import cv2
+        from PIL import Image
     except ImportError:
-        print("bake_vertex_color_texture skipped: numpy or cv2 not installed")
+        print("bake_vertex_color_texture skipped: numpy, cv2, or PIL not installed")
         return None
 
     vertices = np.asarray(mesh.vertices)
@@ -766,11 +1116,11 @@ def bake_vertex_color_texture(mesh, out_dir: Path) -> Path | None:
     texture_size = 2048
     texture = np.zeros((texture_size, texture_size, 3), dtype=np.uint8)
 
-    obj_path = out_dir / "result_textured.obj"
-    mtl_path = out_dir / "result_textured.mtl"
-    tex_path = out_dir / "result_texture.png"
+    obj_path = out_dir / obj_name
+    mtl_path = out_dir / mtl_name
+    tex_path = out_dir / texture_name
 
-    # 아주 단순한 planar UV 생성: XZ 기준
+    # Simple planar UV generation: XZ projection. Used only as a fallback.
     min_x, min_z = vertices[:, 0].min(), vertices[:, 2].min()
     max_x, max_z = vertices[:, 0].max(), vertices[:, 2].max()
 
@@ -781,27 +1131,25 @@ def bake_vertex_color_texture(mesh, out_dir: Path) -> Path | None:
     uvs[:, 0] = (vertices[:, 0] - min_x) / range_x
     uvs[:, 1] = (vertices[:, 2] - min_z) / range_z
 
-    # texture에 vertex color 찍기
     for i, uv in enumerate(uvs):
         x = int(np.clip(uv[0] * (texture_size - 1), 0, texture_size - 1))
         y = int(np.clip((1.0 - uv[1]) * (texture_size - 1), 0, texture_size - 1))
 
         color = np.clip(colors[i] * 255.0, 0, 255).astype(np.uint8)
-        texture[y, x] = color[::-1]  # RGB -> BGR for cv2
+        texture[y, x] = color
 
-    # 빈 공간 보간용 dilation
     mask = np.any(texture > 0, axis=2).astype(np.uint8) * 255
     kernel = np.ones((5, 5), np.uint8)
 
     for _ in range(20):
         dilated = cv2.dilate(texture, kernel, iterations=1)
-        empty = mask == 0
+        grown_mask = cv2.dilate(mask, kernel, iterations=1)
+        empty = (mask == 0) & (grown_mask > 0)
         texture[empty] = dilated[empty]
-        mask = np.any(texture > 0, axis=2).astype(np.uint8) * 255
+        mask[empty] = 255
 
-    cv2.imwrite(str(tex_path), texture)
+    Image.fromarray(texture, mode="RGB").save(tex_path)
 
-    # MTL 저장
     with open(mtl_path, "w", encoding="utf-8") as f:
         f.write("newmtl baked_material\n")
         f.write("Ka 1.000 1.000 1.000\n")
@@ -811,7 +1159,6 @@ def bake_vertex_color_texture(mesh, out_dir: Path) -> Path | None:
         f.write("illum 2\n")
         f.write(f"map_Kd {tex_path.name}\n")
 
-    # OBJ 저장
     with open(obj_path, "w", encoding="utf-8") as f:
         f.write(f"mtllib {mtl_path.name}\n")
         f.write("usemtl baked_material\n")
@@ -823,12 +1170,12 @@ def bake_vertex_color_texture(mesh, out_dir: Path) -> Path | None:
             f.write(f"vt {uv[0]} {uv[1]}\n")
 
         for tri in triangles:
-            # OBJ index는 1부터 시작
             a, b, c = tri + 1
             f.write(f"f {a}/{a} {b}/{b} {c}/{c}\n")
 
-    print(f"baked texture obj={obj_path}")
+    print(f"baked fallback vertex-color texture obj={obj_path}")
     return obj_path
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
